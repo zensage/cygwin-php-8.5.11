@@ -97,11 +97,19 @@ time make install
 
 2. **下载 PHP 源码**（`php-8.5.11.tar.xz` / `.tar.gz`）。
 
-3. **在本机编译并安装 `libzip` 和 `libsodium`**。
+3. **在本机编译并安装 `libzip` 和 `libsodium`**。[系统自带版本无法在 php-8.5.11 中构建]
+LIBSODIUM_VER="1.0.22"
+LIBSODIUM_URL="https://download.libsodium.org/libsodium/releases/libsodium-${LIBSODIUM_VER}.tar.gz"
+LIBSODIUM_DIR="libsodium-${LIBSODIUM_VER}"
 
-4. **使用 `php85-build-cygwin.sh` 配置、编译并安装 PHP**。
+LIBZIP_VER="1.12"
+LIBZIP_URL="https://libzip.org/download/libzip-${LIBZIP_VER}.tar.gz"
+LIBZIP_DIR="libzip-${LIBZIP_VER}"
 
-5. **运行测试**，验证安装是否正常。
+
+5. **使用 `php85-build-cygwin.sh` 配置、编译并安装 PHP**。
+
+6. **运行测试**，验证安装是否正常。
 
 也可以改用包管理器方式：
 
