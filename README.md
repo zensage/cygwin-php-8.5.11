@@ -142,5 +142,3 @@ Scan for additional .ini files in: /usr/local/php8.5/etc/php.d
 ```
 ```
 ---
-
-If this looks good, I will generate the Chinese version `readme_zhCN.md`.
