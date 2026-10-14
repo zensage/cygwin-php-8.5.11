@@ -1,5 +1,5 @@
 # README.md
-
+**English** | [中文](README_zhCN.md)
 ```markdown
 # PHP 8.5.11 on Cygwin
 
