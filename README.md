@@ -3,6 +3,13 @@
 ```markdown
 # PHP 8.5.11 on Cygwin
 
+target: run composer
+composer not run problem: 
+./configure add two config
+--with-external-pcre
+--enable-filter
+
+
 ## Background
 
 The newest PHP available in the Cygwin package repository is **8.1.28**, but I need to run **PHP 8.5.11**.
