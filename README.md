@@ -161,7 +161,7 @@ Scan for additional .ini files in: /usr/local/php8.5/etc/php.d
 ```
 ## run result
 
-** php base and extension and config is run ok **
+** `php base and extension and config is run ok` **
 ```
 /usr/local/php8.5/bin/php -v && /usr/local/php8.5/bin/php --ini && /usr/local/php8.5/bin/php-config
 PHP 8.5.11 (cli) (built: Oct 17 2026 13:12:20) (NTS)
@@ -212,7 +212,7 @@ Options:
   --vernum            [80511]
 ```
 
-** pecl and composer check ok **
+** `pecl and composer is run ok` **
 ```
 /usr/local/php8.5/bin/pecl help version && /usr/local/php8.5/bin/php /usr/local/php8.5/bin/composer diagnose
 PEAR Version: 1.10.18
