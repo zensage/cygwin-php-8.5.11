@@ -111,16 +111,13 @@ If you need **dynamic extension DLLs** instead of a static build, the process is
 
 2. **Download the PHP source** (`php-8.5.11.tar.xz` / `.tar.gz`).
 
-3. **Build and install `libzip` and `libsodium`** on the local machine.[low version can't build at php-8.5.11]
-LIBSODIUM_VER="1.0.22"
-LIBSODIUM_URL="https://download.libsodium.org/libsodium/releases/libsodium-${LIBSODIUM_VER}.tar.gz"
-LIBSODIUM_DIR="libsodium-${LIBSODIUM_VER}"
-
+3. **Build and install `libzip` ** on the local machine.[low version can't build at php-8.5.11]
 LIBZIP_VER="1.12"
 LIBZIP_URL="https://libzip.org/download/libzip-${LIBZIP_VER}.tar.gz"
 LIBZIP_DIR="libzip-${LIBZIP_VER}"
 
 4. **Configure, build, and install PHP** with `php85-build-cygwin.sh`.
+need do some hacks. please check php85-share-build.sh
 
 5. **Run smoke tests** to verify the installation.
 
