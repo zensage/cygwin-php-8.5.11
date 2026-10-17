@@ -1,0 +1,1807 @@
+#!/bin/bash
+# apt-cyg2: install tool for Cygwin similar to debian apt-get
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2005-9 Stephen Jungels
+# Copyright (c) 2013 Trans-code Design
+# Copyright (c) 2026 ZenSage Design 
+# https://github.com/zensage/apt-cyg2/
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+# compare major and minor numerically, "4.10" must not look older than "4.2"
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2) ))
+then
+  echo 'Bash version 4.2+ required' >&2
+  exit 1
+fi
+
+# a failure anywhere in a pipeline fails the whole pipeline
+set -o pipefail
+
+usage="\
+NAME
+  apt-cyg2 - package manager utility
+
+SYNOPSIS
+  apt-cyg2 [operation] [options] [targets]
+
+DESCRIPTION
+  apt-cyg2 is a package management utility that tracks installed packages on a
+  Cygwin system. Invoking apt-cyg2 involves specifying an operation with any
+  potential options and targets to operate on. A target is usually a package
+  name, file name, URL, or a search string. Targets can be provided as command
+  line arguments, or one per line on a pipe.
+
+OPERATIONS
+  install       Install package(s) and their dependencies.
+  localinstall  Install package archive file(s) from the local disk.
+  reinstall     Reinstall installed package(s).
+  upgrade       Upgrade all (or the named) installed packages.
+  remove        Remove package(s); refuses if other packages depend on them.
+  autoremove    Remove dependency packages that nothing needs any more.
+  check         Verify the installation (database, dependencies, manifests).
+  update        Download a fresh copy of the package list (setup.ini).
+  download      Retrieve package(s) into the cache, do not install.
+  show          Display information on given package(s).
+  depends       Produce a dependency tree for a package.
+  rdepends      Produce a tree of packages that depend on the named package.
+  list          List installed packages, optionally matching regexp(s).
+  listall       List available packages matching regexp(s).
+  category      Display all packages that are members of a named category.
+  listfiles     List all files owned by given package(s).
+  search        Find installed packages that own the specified file(s).
+  searchall     Search cygwin.com for packages that contain the file(s).
+  mirror        Set the mirror URL, or display it if none is given.
+  cache         Set the package cache directory, or display it.
+
+OPTIONS
+  --nodeps      Skip all dependency handling.
+  --noscripts   Do not run postinstall / preremove scripts.
+  -s, --simulate, --dry-run
+                Show what would be done, change nothing.
+  -y, --yes     Do not ask for confirmation.
+  --force       Remove even if other packages depend on the target;
+                allow replacing the running cygwin package.
+  --fix         With check: install missing dependencies, reinstall
+                broken packages.
+  --files       With check: also verify that every packaged file exists.
+  --name=PKG    With localinstall: package name, when the file name does not
+                follow the NAME-VERSION-RELEASE.tar.* convention.
+  --version     Display version and exit.
+  -h, --help    Display this help and exit.
+
+ENVIRONMENT
+  APT_CYG_ROOT        Operate on an alternate root directory (testing).
+  APT_CYG_ARCH        Override the architecture (x86_64 or x86).
+  APT_CYG_DOWNLOADER  Force the downloader: wget, curl or lynx.
+"
+
+version="\
+apt-cyg version 2.0
+Copyright (c) 2005-9 Stephen Jungels
+Copyright (c) 2013 Trans-code Design
+Copyright (c) 2026 ZenSage Design
+"
+
+COMMANDS='install localinstall reinstall upgrade remove autoremove check update
+  download show depends rdepends list listall category listfiles search
+  searchall mirror cache'
+# commands that read package names from a pipe when none are given
+TARGET_COMMANDS='install localinstall reinstall remove download show
+  depends rdepends category listfiles search searchall'
+# commands that change the system and therefore take the lock
+MUTATING_COMMANDS='install localinstall reinstall upgrade remove autoremove
+  update mirror cache'
+
+# every system path hangs off ROOT, so a test can run against a fake tree
+ROOT=${APT_CYG_ROOT%/}
+SETUP=$ROOT/etc/setup
+DB=$SETUP/installed.db
+RC=$SETUP/setup.rc
+POSTINSTALL=$ROOT/etc/postinstall
+PREREMOVE=$ROOT/etc/preremove
+LOGFILE=$ROOT/var/log/apt-cyg.log
+LOCKDIR=$SETUP/.apt-cyg.lock
+# dependencies of locally installed packages, which setup.ini does not know
+LOCALDEPS=$SETUP/apt-cyg2-localdeps
+ESSENTIAL_PKGS='base-cygwin base-files bash bzip2 coreutils cygwin dash
+  findutils gawk grep gzip sed tar xz'
+export APT_CYG_ROOT=$ROOT
+
+declare -A IDX_FILE IDX_HASH IDX_VER IDX_DEPS IDX_CAT
+declare -A INST_FILE INST_FLAG
+declare -A PLAN_SEEN PLAN_ACT PLAN_FLAG PLAN_ARCHIVE UPG_SET REINST_SET
+PLAN=()
+PLAN_MISSING=()
+pks=()
+DB_HEADER='INSTALLED.DB 3'
+IDX_MAGIC='#apt-cyg2-index|1'
+
+# ---------------------------------------------------------------------------
+# messages, cleanup and locking
+
+function warn {
+  # red only when a human is looking at stderr
+  if [[ -t 2 ]]
+  then
+    printf '\e[1;31m%s\e[m\n' "$*" >&2
+  else
+    printf '%s\n' "$*" >&2
+  fi
+}
+
+function die {
+  warn "$@"
+  exit 1
+}
+
+function log-action {
+  local ts
+  printf -v ts '%(%F %T)T' -1
+  mkdir -p -- "${LOGFILE%/*}" 2>/dev/null &&
+    printf '%s %s\n' "$ts" "$*" >> "$LOGFILE" 2>/dev/null
+  return 0
+}
+
+function cleanup {
+  [[ $LOCKED ]] && rm -rf -- "$LOCKDIR"
+  [[ $TMPD ]] && rm -rf -- "$TMPD"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+function acquire-lock {
+  local pid tries=0
+  mkdir -p -- "$SETUP" || die "cannot create $SETUP"
+  # mkdir is atomic, so it is a portable mutex even where flock is missing
+  until mkdir -- "$LOCKDIR" 2>/dev/null
+  do
+    pid=$(cat -- "$LOCKDIR/pid" 2>/dev/null)
+    if [[ $pid ]] && kill -0 "$pid" 2>/dev/null
+    then
+      die "another apt-cyg (pid $pid) is running, lock: $LOCKDIR"
+    fi
+    # the owner may not have written its pid yet, give it a moment
+    if [[ ! $pid ]] && (( tries++ < 2 ))
+    then
+      sleep 1
+      continue
+    fi
+    warn "removing stale lock $LOCKDIR"
+    rm -rf -- "$LOCKDIR"
+  done
+  echo $$ > "$LOCKDIR/pid"
+  LOCKED=1
+}
+
+function confirm {
+  # never block scripts, pipes or --yes
+  [[ -v yes || ! -t 0 || ! -t 1 ]] && return 0
+  local answer
+  read -r -p 'Do you want to continue? [Y/n] ' answer
+  [[ -z $answer || $answer == [Yy]* ]]
+}
+
+function check-packages {
+  if (( ${#pks[@]} ))
+  then
+    return 0
+  else
+    warn No packages found.
+    return 1
+  fi
+}
+
+function in-list {
+  # in-list WORD LIST: whole-word membership in a space separated list
+  [[ " ${2//$'\n'/ } " == *" $1 "* ]]
+}
+
+# ---------------------------------------------------------------------------
+# downloading
+
+function downloader {
+  if [[ ! $DOWNLOADER ]]
+  then
+    if [[ $APT_CYG_DOWNLOADER ]]
+    then
+      DOWNLOADER=$APT_CYG_DOWNLOADER
+    elif command -v wget >/dev/null
+    then
+      DOWNLOADER=wget
+    elif command -v curl >/dev/null
+    then
+      DOWNLOADER=curl
+    elif command -v lynx >/dev/null
+    then
+      DOWNLOADER=lynx
+    else
+      DOWNLOADER=none
+    fi
+  fi
+  echo "$DOWNLOADER"
+}
+
+function wget-has-compression {
+  # --compression appeared in wget 1.19.2, probe it once
+  if [[ ! $WGET_COMPRESSION ]]
+  then
+    command wget --help 2>&1 | grep -q -- --compression &&
+      WGET_COMPRESSION=yes || WGET_COMPRESSION=no
+  fi
+  [[ $WGET_COMPRESSION == yes ]]
+}
+
+function fetch {
+  # fetch URL DEST [text]: download through a temp name so a broken
+  # transfer never leaves a truncated file under the real name
+  local url=$1 out=$2 part=$2.part.$$ rc opts
+  case $url in
+    file://*)
+      cp -- "${url#file://}" "$part" ;;
+    /*)
+      cp -- "$url" "$part" ;;
+    *)
+      case $(downloader) in
+        wget)
+          opts=(-O "$part")
+          [[ -t 2 ]] && opts+=(--progress=bar) || opts+=(-nv)
+          # gzip transfer helps plain text only, packages are xz/zst already
+          # and a Content-Encoding on them could break the checksum
+          [[ $3 == text ]] && wget-has-compression && opts+=(--compression=auto)
+          command wget "${opts[@]}" "$url" ;;
+        curl)
+          opts=(-fL --retry 2 -o "$part")
+          [[ -t 2 ]] || opts+=(-sS)
+          [[ $3 == text ]] && opts+=(--compressed)
+          command curl "${opts[@]}" "$url" ;;
+        lynx)
+          # lynx has no -O, so redirect explicitly instead of guessing a name
+          command lynx -source "$url" > "$part" ;;
+        *)
+          warn 'no downloader found, install wget, curl or lynx'
+          false ;;
+      esac ;;
+  esac
+  rc=$?
+  if (( rc == 0 )) && [[ -e $part ]]
+  then
+    mv -f -- "$part" "$out"
+  else
+    rm -f -- "$part"
+    return 1
+  fi
+}
+
+function fetch-newer {
+  # fetch-newer URL DEST: let wget -N skip the transfer when unchanged
+  local url=$1 out=$2
+  if [[ $url == http* && $(downloader) == wget ]]
+  then
+    ( cd -- "${out%/*}" && command wget -N -nv "$url" ) && [[ -s $out ]]
+  else
+    fetch "$url" "$out"
+  fi
+}
+
+function verify-hash {
+  # verify-hash FILE DIGEST: the digest length tells the algorithm
+  local f=$1 d=$2 tool sum
+  case ${#d} in
+     32) tool=md5sum    ;;
+     64) tool=sha256sum ;;
+    128) tool=sha512sum ;;
+      *) warn "no usable checksum for ${f##*/}"; return 1 ;;
+  esac
+  # read from stdin so file names with spaces cannot confuse the tool
+  sum=$("$tool" < "$f") || return 1
+  [[ ${sum%% *} == "$d" ]]
+}
+
+function urlencode {
+  local LC_ALL=C s=$1 i c out=
+  for (( i = 0; i < ${#s}; i++ ))
+  do
+    c=${s:i:1}
+    case $c in
+      [a-zA-Z0-9._~-]) out+=$c ;;
+      *) printf -v c '%%%02X' "'$c"; out+=$c ;;
+    esac
+  done
+  echo "$out"
+}
+
+# ---------------------------------------------------------------------------
+# setup.rc, workspace and setup.ini
+
+function rc-get {
+  [[ -f $RC ]] || return 1
+  # a key line is followed by its tab indented value
+  key=$1 gawk '
+  $0 == ENVIRON["key"] {
+    getline
+    sub(/^\t/, "")
+    print
+    exit
+  }
+  ' "$RC"
+}
+
+function rc-set {
+  mkdir -p -- "$SETUP" && touch -- "$RC" || return 1
+  # values travel through ENVIRON, -v would eat the backslashes of C:\path
+  key=$1 val=$2 gawk '
+  skip && /^\t/ { next }
+  { skip = 0 }
+  $0 == ENVIRON["key"] {
+    print
+    print "\t" ENVIRON["val"]
+    skip = found = 1
+    next
+  }
+  1
+  END {
+    if (! found) {
+      print ENVIRON["key"]
+      print "\t" ENVIRON["val"]
+    }
+  }
+  ' "$RC" > "$RC.tmp.$$" && mv -f -- "$RC.tmp.$$" "$RC"
+}
+
+function find-workspace {
+  # find-workspace [soft]: soft returns 1 instead of dying when unconfigured
+  local soft=$1
+  [[ $archdir ]] && return 0
+  cache=$(rc-get last-cache)
+  mirror=$(rc-get last-mirror)
+  if [[ ! $cache || ! $mirror ]]
+  then
+    [[ $soft ]] && return 1
+    die "no cache or mirror configured; run setup.exe once, or use" \
+        "'apt-cyg2 cache DIR' and 'apt-cyg2 mirror URL'"
+  fi
+  # setup.rc holds a windows path, cygwin tools want a posix one
+  if [[ $cache == *\\* || $cache == ?:* ]] && command -v cygpath >/dev/null
+  then
+    cache=$(cygpath -u "$cache")
+  fi
+  # same encoding setup.exe uses, so both tools share one download cache
+  mirrordir=$(sed '
+  s / %2f g
+  s : %3a g
+  ' <<< "$mirror")
+  mirrorurl=${mirror%/}
+  cachedir=$cache/$mirrordir
+  archdir=$cachedir/$arch
+  mkdir -p -- "$archdir" || die "cannot create $archdir"
+  if [[ ! -s $archdir/setup.ini && ! $no_auto_setup ]]
+  then
+    get-setup || { [[ $soft ]] && return 1; die "cannot get setup.ini from $mirror"; }
+  fi
+  return 0
+}
+
+function get-setup {
+  local ext tool src= sum
+  # smallest and fastest to unpack first; bz2 is the slow fallback
+  for ext in zst xz bz2
+  do
+    case $ext in
+      zst) tool=zstd  ;;
+       xz) tool=xz    ;;
+      bz2) tool=bzip2 ;;
+    esac
+    command -v $tool >/dev/null || continue
+    if fetch-newer "$mirrorurl/$arch/setup.$ext" "$archdir/setup.$ext"
+    then
+      src=setup.$ext
+      break
+    fi
+  done
+
+  if [[ $src ]]
+  then
+    # the compressed copy is kept, so an unchanged list needs no unpacking
+    sum=$(md5sum < "$archdir/$src")
+    sum=${sum%% *}
+    if [[ -s $archdir/setup.ini && $(cat -- "$archdir/$src.md5" 2>/dev/null) == "$sum" ]]
+    then
+      echo setup.ini is up to date
+      return 0
+    fi
+    $tool -dc < "$archdir/$src" > "$archdir/setup.ini.tmp"
+  else
+    # last resort: an uncompressed setup.ini
+    fetch "$mirrorurl/$arch/setup.ini" "$archdir/setup.ini.tmp"
+  fi
+
+  # a real package list has package records, an error page does not
+  if [[ -s $archdir/setup.ini.tmp ]] && grep -q '^@ ' "$archdir/setup.ini.tmp"
+  then
+    [[ -f $archdir/setup.ini ]] && cp -p -- "$archdir/setup.ini" "$archdir/setup.ini-save"
+    mv -f -- "$archdir/setup.ini.tmp" "$archdir/setup.ini"
+    [[ $src ]] && echo "$sum" > "$archdir/$src.md5"
+    rm -f -- "$archdir/setup.idx"
+    echo "Updated setup.ini${src:+ (from $src)}"
+    return 0
+  fi
+  rm -f -- "$archdir/setup.ini.tmp"
+  [[ $src ]] && rm -f -- "$archdir/$src" "$archdir/$src.md5"
+  warn 'Error updating setup.ini, keeping the old copy'
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# package index: setup.ini reduced to one line per package, built once
+
+IDX_AWK='
+function verfromfile(n, f,    b) {
+  b = f
+  sub(/.*\//, "", b)
+  sub(/\.tar\.[a-z0-9]+$/, "", b)
+  if (index(b, n "-") == 1)
+    b = substr(b, length(n) + 2)
+  return b
+}
+function deplist(s,    n, i, a, out) {
+  # "a, b (>= 1.0), c" -> "a b c"
+  gsub(/\([^)]*\)/, "", s)
+  n = split(s, a, /[ ,]+/)
+  out = ""
+  for (i = 1; i <= n; i++)
+    if (a[i] != "")
+      out = out (out == "" ? "" : " ") a[i]
+  return out
+}
+function flush() {
+  if (name == "") return
+  if (ver == "" && file != "") ver = verfromfile(name, file)
+  print name, file, size, hash, ver, (d2 != "" ? d2 : req), cats
+}
+BEGIN {
+  OFS = "|"
+  print "#apt-cyg2-index", "1"
+}
+# continuation lines of a multi-line quoted field (ldesc, message) are text,
+# even when they happen to start with "install:" or "@ "
+inq {
+  if (gsub(/"/, "&") % 2) inq = 0
+  next
+}
+/^@ / {
+  flush()
+  name = $2
+  file = size = hash = ver = req = d2 = cats = ""
+  curr = 1
+  next
+}
+name == "" { next }
+# [prev] and [test] follow the current version, ignore them
+/^\[/ { curr = 0 }
+curr && $1 == "version:"  { ver = $2 }
+curr && $1 == "install:"  { file = $2; size = $3; hash = $4 }
+curr && $1 == "requires:" { req = deplist(substr($0, 10)) }
+# newer setup.ini lists dependencies (with versions) in depends2
+curr && $1 == "depends2:" { d2 = deplist(substr($0, 10)) }
+$1 == "category:" { cats = substr($0, 10); sub(/^ +/, "", cats) }
+{ if (gsub(/"/, "&") % 2) inq = 1 }
+END { flush() }
+'
+
+function build-index {
+  local idx=$archdir/setup.idx hdr
+  # reuse the index until setup.ini changes
+  if [[ -s $idx && ! $archdir/setup.ini -nt $idx ]] && read -r hdr < "$idx" &&
+     [[ $hdr == "$IDX_MAGIC" ]]
+  then
+    return 0
+  fi
+  gawk "$IDX_AWK" "$archdir/setup.ini" > "$idx.tmp.$$" &&
+    mv -f -- "$idx.tmp.$$" "$idx" || { rm -f -- "$idx.tmp.$$"; return 1; }
+}
+
+function load-index {
+  [[ $INDEX_LOADED ]] && return 0
+  build-index || die 'cannot build the package index'
+  local n f s h v d c
+  # '|' rather than tab: a non-blank IFS keeps empty fields in place
+  while IFS='|' read -r n f s h v d c
+  do
+    [[ $n == '#'* ]] && continue
+    IDX_FILE[$n]=$f
+    IDX_HASH[$n]=$h
+    IDX_VER[$n]=$v
+    IDX_DEPS[$n]=$d
+    IDX_CAT[$n]=$c
+  done < "$archdir/setup.idx"
+  INDEX_LOADED=1
+}
+
+function in-index {
+  [[ -n ${IDX_FILE[$1]} ]]
+}
+
+# ---------------------------------------------------------------------------
+# installed.db
+
+function load-db {
+  [[ $DB_LOADED ]] && return 0
+  local n f flag first=1
+  if [[ -f $DB ]]
+  then
+    while read -r n f flag _
+    do
+      if (( first ))
+      then
+        first=0
+        if [[ $n == INSTALLED.DB ]]
+        then
+          DB_HEADER="$n $f"
+          continue
+        fi
+      fi
+      [[ $n ]] || continue
+      INST_FILE[$n]=$f
+      INST_FLAG[$n]=${flag:-0}
+    done < "$DB"
+  fi
+  # "pkg dep dep ..." lines; load-index later overrides names it knows
+  if [[ -f $LOCALDEPS ]]
+  then
+    while read -r n f
+    do
+      [[ $n && ! ${IDX_FILE[$n]} ]] && IDX_DEPS[$n]=$f
+    done < "$LOCALDEPS"
+  fi
+  DB_LOADED=1
+}
+
+function set-local-deps {
+  # set-local-deps PKG [DEPS]: record (or with no DEPS, forget) local deps
+  local p=$1 deps=$2
+  mkdir -p -- "$SETUP"
+  {
+    [[ -f $LOCALDEPS ]] && p=$p gawk '$1 != ENVIRON["p"]' "$LOCALDEPS"
+    [[ ${deps// } ]] && printf '%s %s\n' "$p" "$deps"
+  } > "$LOCALDEPS.tmp.$$" && mv -f -- "$LOCALDEPS.tmp.$$" "$LOCALDEPS"
+}
+
+function save-db {
+  local tmp=$DB.tmp.$$ p
+  mkdir -p -- "$SETUP"
+  {
+    # the header must stay on line one, so only the body is sorted;
+    # the third field is setup.exe's "picked by the user" flag
+    printf '%s\n' "$DB_HEADER"
+    for p in "${!INST_FILE[@]}"
+    do
+      printf '%s %s %s\n' "$p" "${INST_FILE[$p]}" "${INST_FLAG[$p]:-0}"
+    done | LC_ALL=C sort
+  } > "$tmp" || { rm -f -- "$tmp"; die "cannot write $DB"; }
+  [[ -f $DB ]] && cp -p -- "$DB" "$DB-save"
+  # rename is atomic, a crash never leaves a half-written database
+  mv -f -- "$tmp" "$DB"
+}
+
+function is-installed {
+  [[ -n ${INST_FILE[$1]} ]]
+}
+
+function file-version {
+  # file-version PKG FILE: pkg-1.2-3.tar.xz -> 1.2-3
+  local b=${2##*/}
+  b=${b%.tar.*}
+  echo "${b#"$1"-}"
+}
+
+function is-upgradable {
+  # setup.exe semantics: "current" differs from what is installed
+  is-installed "$1" && in-index "$1" &&
+    [[ ${INST_FILE[$1]} != "${IDX_FILE[$1]##*/}" ]]
+}
+
+function sorted-installed {
+  (( ${#INST_FILE[@]} )) && printf '%s\n' "${!INST_FILE[@]}" | LC_ALL=C sort
+}
+
+function is-essential {
+  local p=$1
+  in-list "$p" "$ESSENTIAL_PKGS" && return 0
+  # on a live system also protect packages owning a dll the core tools load
+  if [[ -z $ROOT && -f $SETUP/$p.lst.gz ]] && command -v cygcheck >/dev/null
+  then
+    if [[ ! $ESS_DLLS ]]
+    then
+      ESS_DLLS=$(cygcheck awk bash bunzip2 grep gzip mv sed tar xz 2>/dev/null |
+        gawk -F'[/\\\\]' 'tolower($NF) ~ /\.dll$/ { print tolower($NF) }' | sort -u)
+    fi
+    gzip -cd -- "$SETUP/$p.lst.gz" | ESS_DLLS=$ESS_DLLS gawk -F/ '
+    BEGIN {
+      n = split(ENVIRON["ESS_DLLS"], a, "\n")
+      for (i = 1; i <= n; i++) ess[a[i]]
+    }
+    tolower($NF) in ess { hit = 1; exit }
+    END { exit ! hit }
+    ' && return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# scripts
+
+function run-script {
+  local s=$1 rc
+  echo "Running ${s##*/}"
+  case $s in
+    *.sh)
+      ( cd -- "$ROOT/" && command bash --norc --noprofile "$s" ) ;;
+    *.dash)
+      if command -v dash >/dev/null
+      then
+        ( cd -- "$ROOT/" && command dash "$s" )
+      else
+        ( cd -- "$ROOT/" && command sh "$s" )
+      fi ;;
+    *.bat | *.cmd)
+      if command -v cmd >/dev/null && command -v cygpath >/dev/null
+      then
+        ( cd -- "$ROOT/" && command cmd /c "$(cygpath -w "$s")" )
+      else
+        warn "cannot run ${s##*/}: cmd.exe not available"
+        return 1
+      fi ;;
+  esac
+  rc=$?
+  (( rc )) && warn "${s##*/} exited with status $rc"
+  return $rc
+}
+
+function run-postinstall {
+  local list s rc=0
+  if [[ -v noscripts ]]
+  then
+    echo 'Skipping postinstall scripts (--noscripts)'
+    return 0
+  fi
+  [[ -d $POSTINSTALL ]] || return 0
+  # setup.exe order: 0p_ perpetual, then one-shot scripts, then zp_ perpetual;
+  # .dash matters most: autorebase ships as a perpetual .dash script
+  mapfile -t list < <(
+    cd -- "$POSTINSTALL" &&
+    for s in *.sh *.dash *.bat *.cmd
+    do
+      [[ -f $s ]] && printf '%s\n' "$s"
+    done | gawk '{ print (/^0p_/ ? 0 : /^zp_/ ? 2 : 1) "\t" $0 }' |
+      LC_ALL=C sort | cut -f2-
+  )
+  for s in "${list[@]}"
+  do
+    if run-script "$POSTINSTALL/$s"
+    then
+      # perpetual scripts must run after every install, never mark them done
+      case $s in
+        0p_* | zp_*) ;;
+        *) mv -f -- "$POSTINSTALL/$s" "$POSTINSTALL/$s.done" ;;
+      esac
+    else
+      rc=1
+    fi
+  done
+  return $rc
+}
+
+function run-preremove {
+  local s
+  [[ -v noscripts ]] && return 0
+  for s in "$PREREMOVE/$1".{sh,dash,bat,cmd}
+  do
+    [[ -f $s ]] || continue
+    run-script "$s"
+    rm -f -- "$s"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# files
+
+function delete-paths {
+  # delete-paths LISTFILE: remove the listed files, then emptied directories
+  local e full dirs=()
+  while IFS= read -r e
+  do
+    e=${e#./}
+    e=${e#/}
+    # never touch the root itself or anything escaping it
+    [[ -z $e || $e == . || /$e/ == */../* ]] && continue
+    full=$ROOT/$e
+    if [[ $e == */ ]]
+    then
+      dirs+=("${full%/}")
+    elif [[ -L $full || -f $full ]]
+    then
+      rm -f -- "$full"
+    elif [[ -d $full ]]
+    then
+      dirs+=("$full")
+    fi
+  done < "$1"
+  # deepest first, so a parent is already empty when its turn comes
+  (( ${#dirs[@]} )) && printf '%s\n' "${dirs[@]}" |
+    gawk -F/ '{ print NF "\t" $0 }' | LC_ALL=C sort -t$'\t' -k1,1nr | cut -f2- |
+    while IFS= read -r e
+    do
+      rmdir -- "$e" 2>/dev/null
+    done
+  return 0
+}
+
+function install-archive {
+  # install-archive PKG ARCHIVE FLAG: unpack, record manifest and database;
+  # FLAG is 1 (manual), 0 (dependency) or keep
+  local p=$1 arc=$2 flag=$3 man=$SETUP/$1.lst.gz rc=0
+  local new=$TMPD/$1.new old=$TMPD/$1.old
+  mkdir -p -- "$SETUP"
+  if is-installed "$p" && [[ -f $man ]]
+  then
+    gzip -cd -- "$man" > "$old"
+    run-preremove "$p"
+  fi
+  # one pass both unpacks and yields the file list (the old code read twice)
+  tar -x -v --quoting-style=literal -f "$arc" -C "$ROOT/" > "$new" || rc=1
+  (( rc )) && warn "extraction of ${arc##*/} was incomplete, try reinstall later"
+  gzip -c "$new" > "$man.tmp.$$" && mv -f -- "$man.tmp.$$" "$man"
+  # an upgrade drops files the new version no longer ships
+  if [[ -f $old ]]
+  then
+    LC_ALL=C comm -23 <(LC_ALL=C sort -u "$old") <(LC_ALL=C sort -u "$new") > "$old.stale"
+    delete-paths "$old.stale"
+  fi
+  INST_FILE[$p]=${arc##*/}
+  case $flag in
+    keep) INST_FLAG[$p]=${INST_FLAG[$p]:-0} ;;
+       *) INST_FLAG[$p]=$flag ;;
+  esac
+  save-db
+  return $rc
+}
+
+function remove-package {
+  local p=$1 man=$SETUP/$1.lst.gz
+  if [[ -f $man ]]
+  then
+    run-preremove "$p"
+    gzip -cd -- "$man" > "$TMPD/$p.rm"
+    delete-paths "$TMPD/$p.rm"
+  else
+    warn "manifest of $p is missing, only its database entry is removed"
+  fi
+  rm -f -- "$man" "$POSTINSTALL/$p".{sh,dash,bat,cmd}.done
+  unset 'INST_FILE[$p]' 'INST_FLAG[$p]'
+  save-db
+  [[ -f $LOCALDEPS ]] && grep -q "^$p " "$LOCALDEPS" && set-local-deps "$p"
+  log-action "remove $p"
+  echo "Package $p removed"
+}
+
+# ---------------------------------------------------------------------------
+# planning and execution
+
+function fetch-package {
+  # fetch-package PKG: download into the cache and verify; path in REPLY
+  local p=$1 path=${IDX_FILE[$1]} hash=${IDX_HASH[$1]} dest
+  dest=$cachedir/$path
+  mkdir -p -- "${dest%/*}" || return 1
+  if [[ -f $dest ]] && verify-hash "$dest" "$hash"
+  then
+    echo "Found ${path##*/} in cache"
+  else
+    echo "Downloading ${path##*/}"
+    fetch "$mirrorurl/$path" "$dest" || { warn "download failed: $p"; return 1; }
+    if ! verify-hash "$dest" "$hash"
+    then
+      warn "checksum mismatch: ${path##*/}"
+      rm -f -- "$dest"
+      return 1
+    fi
+  fi
+  REPLY=$dest
+}
+
+function plan-visit {
+  # depth first, dependencies before dependents; marking a node seen before
+  # descending is what breaks dependency cycles
+  local p=$1 d
+  [[ ${PLAN_SEEN[$p]} ]] && return 0
+  PLAN_SEEN[$p]=1
+  if ! in-index "$p"
+  then
+    is-installed "$p" || PLAN_MISSING+=("$p")
+    return 0
+  fi
+  if [[ ! -v nodeps ]]
+  then
+    for d in ${IDX_DEPS[$p]}
+    do
+      plan-visit "$d"
+    done
+  fi
+  if ! is-installed "$p"
+  then
+    PLAN+=("$p")
+    PLAN_ACT[$p]=install
+  elif [[ ${UPG_SET[$p]} ]]
+  then
+    PLAN+=("$p")
+    PLAN_ACT[$p]=upgrade
+  elif [[ ${REINST_SET[$p]} ]]
+  then
+    PLAN+=("$p")
+    PLAN_ACT[$p]=reinstall
+  fi
+}
+
+function report-missing {
+  local p
+  for p in "${PLAN_MISSING[@]}"
+  do
+    warn "dependency $p not found in setup.ini, skipping it"
+  done
+}
+
+function show-plan {
+  local p new=() upg=() rei=()
+  for p in "${PLAN[@]}"
+  do
+    case ${PLAN_ACT[$p]} in
+      install) new+=("$p") ;;
+      upgrade)
+        upg+=("$p ($(file-version "$p" "${INST_FILE[$p]}") -> $(file-version "$p" "${PLAN_ARCHIVE[$p]:-${IDX_FILE[$p]}}"))") ;;
+      reinstall) rei+=("$p") ;;
+    esac
+  done
+  if (( ${#new[@]} ))
+  then
+    echo 'The following NEW packages will be installed:'
+    printf '  %s\n' "${new[@]}"
+  fi
+  if (( ${#upg[@]} ))
+  then
+    echo 'The following packages will be upgraded:'
+    printf '  %s\n' "${upg[@]}"
+  fi
+  if (( ${#rei[@]} ))
+  then
+    echo 'The following packages will be reinstalled:'
+    printf '  %s\n' "${rei[@]}"
+  fi
+  echo "${#new[@]} to install, ${#upg[@]} to upgrade, ${#rei[@]} to reinstall."
+}
+
+function execute-plan {
+  local p rc=0 failed=() flag verb
+  # download everything first: a failed download aborts before any change
+  for p in "${PLAN[@]}"
+  do
+    [[ ${PLAN_ARCHIVE[$p]} ]] && continue
+    if fetch-package "$p"
+    then
+      PLAN_ARCHIVE[$p]=$REPLY
+    else
+      failed+=("$p")
+    fi
+  done
+  if (( ${#failed[@]} ))
+  then
+    warn "could not download: ${failed[*]}; nothing was changed"
+    return 1
+  fi
+  for p in "${PLAN[@]}"
+  do
+    case ${PLAN_ACT[$p]} in
+      install)   verb=Installing;   flag=${PLAN_FLAG[$p]:-0} ;;
+      upgrade)   verb=Upgrading;    flag=keep ;;
+      reinstall) verb=Reinstalling; flag=keep ;;
+    esac
+    echo "$verb $p"
+    if install-archive "$p" "${PLAN_ARCHIVE[$p]}" "$flag"
+    then
+      log-action "${PLAN_ACT[$p]} $p ${INST_FILE[$p]}"
+      case ${PLAN_ACT[$p]} in
+        install)   echo "Package $p installed"   ;;
+        upgrade)   echo "Package $p upgraded"    ;;
+        reinstall) echo "Package $p reinstalled" ;;
+      esac
+    else
+      failed+=("$p")
+      rc=1
+    fi
+  done
+  run-postinstall || warn 'some postinstall scripts failed'
+  (( ${#failed[@]} )) && warn "failed: ${failed[*]}"
+  return $rc
+}
+
+function run-plan {
+  # shared tail of install / upgrade / reinstall / localinstall / check --fix
+  report-missing
+  if (( ! ${#PLAN[@]} ))
+  then
+    return 0
+  fi
+  show-plan
+  if [[ -v simulate ]]
+  then
+    echo 'Simulation only, nothing was changed.'
+    return 0
+  fi
+  confirm || { echo Aborted.; return 1; }
+  execute-plan
+}
+
+function guard-running-cygwin {
+  # replacing cygwin1.dll from inside a running cygwin fails or corrupts it
+  if [[ -z $ROOT && ! -v force && $(uname -s) == CYGWIN* ]] && [[ ${1} == cygwin ]]
+  then
+    warn 'skipping cygwin: cygwin1.dll is in use, update it with setup.exe (or use --force)'
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# operations
+
+function apt-update {
+  # do not auto-fetch inside find-workspace, we fetch exactly once here
+  no_auto_setup=1 find-workspace
+  get-setup
+}
+
+function apt-install {
+  check-packages || return 1
+  find-workspace
+  load-index
+  load-db
+  local p req=() marked=0 missing=0
+  for p in "${pks[@]}"
+  do
+    if is-installed "$p"
+    then
+      if [[ ${INST_FLAG[$p]} != 1 ]]
+      then
+        INST_FLAG[$p]=1
+        marked=1
+        echo "Package $p is already installed, marked as manually installed"
+      else
+        echo "Package $p is already installed, skipping"
+      fi
+      continue
+    fi
+    if ! in-index "$p"
+    then
+      warn "Unable to locate package $p"
+      missing=1
+      continue
+    fi
+    req+=("$p")
+    PLAN_FLAG[$p]=1
+  done
+  # like apt-get: an unknown name aborts the whole request, nothing changes
+  (( missing )) && return 1
+  (( marked )) && [[ ! -v simulate ]] && save-db
+  for p in "${req[@]}"
+  do
+    plan-visit "$p"
+  done
+  run-plan
+}
+
+function apt-localinstall {
+  check-packages || return 1
+  load-db
+  local f base stem n deps hint idx=0 bad=0 names=()
+  declare -A LDEPS
+  # an index is only needed to resolve dependencies from the mirror
+  find-workspace soft && load-index && idx=1
+  if [[ -v pkgname ]] && (( ${#pks[@]} > 1 ))
+  then
+    die '--name can only be used with a single file'
+  fi
+  for f in "${pks[@]}"
+  do
+    if [[ ! -f $f ]]
+    then
+      warn "No such file: $f"
+      bad=1
+      continue
+    fi
+    base=${f##*/}
+    stem=${base%.tar.*}
+    if [[ $stem == "$base" ]]
+    then
+      warn "Not a package archive (.tar.*): $f"
+      bad=1
+      continue
+    fi
+    if [[ -v pkgname ]]
+    then
+      n=$pkgname
+    # cygwin convention is NAME-VERSION-RELEASE and VERSION has no dash,
+    # so the name is everything before the last two fields
+    elif [[ $stem =~ ^(.+)-[^-]+-[^-]+$ ]]
+    then
+      n=${BASH_REMATCH[1]}
+    else
+      warn "Cannot tell the package name of $base, use --name=PKG"
+      bad=1
+      continue
+    fi
+    if ! tar -tf "$f" >/dev/null 2>&1
+    then
+      warn "Corrupt or unreadable archive: $f"
+      bad=1
+      continue
+    fi
+    # dependencies: a .hint next to the archive, else the mirror's record
+    hint=${f%.tar.*}.hint
+    if [[ -f $hint ]]
+    then
+      deps=$(gawk '
+      $1 ~ /^(requires|depends|depends2):$/ {
+        sub(/^[^:]*:/, "")
+        gsub(/\([^)]*\)/, "")
+        gsub(/,/, " ")
+        printf "%s ", $0
+      }
+      ' "$hint")
+    else
+      deps=${IDX_DEPS[$n]}
+    fi
+    LDEPS[$n]=$(echo $deps)
+    PLAN_ARCHIVE[$n]=$(cd -- "$(dirname -- "$f")" && pwd)/$base
+    names+=("$n")
+  done
+  (( bad )) && return 1
+  for n in "${names[@]}"
+  do
+    # keep the mirror copy of this package out of the plan
+    PLAN_SEEN[$n]=1
+  done
+  for n in "${names[@]}"
+  do
+    if [[ ! -v nodeps && ${LDEPS[$n]// } ]]
+    then
+      if (( idx ))
+      then
+        for f in ${LDEPS[$n]}
+        do
+          plan-visit "$f"
+        done
+      else
+        warn "no setup.ini available, dependencies of $n not resolved: ${LDEPS[$n]}"
+      fi
+    fi
+    PLAN+=("$n")
+    PLAN_FLAG[$n]=1
+    IDX_DEPS[$n]=${LDEPS[$n]}
+    if ! is-installed "$n"
+    then
+      PLAN_ACT[$n]=install
+    elif [[ ${INST_FILE[$n]} == "${PLAN_ARCHIVE[$n]##*/}" ]]
+    then
+      PLAN_ACT[$n]=reinstall
+    else
+      PLAN_ACT[$n]=upgrade
+    fi
+  done
+  run-plan || return 1
+  [[ -v simulate ]] && return 0
+  # remember the .hint dependencies for remove / autoremove / check
+  for n in "${names[@]}"
+  do
+    is-installed "$n" && ! in-index "$n" && set-local-deps "$n" "${LDEPS[$n]}"
+  done
+  return 0
+}
+
+function apt-reinstall {
+  check-packages || return 1
+  find-workspace
+  load-index
+  load-db
+  local p hit bad=0 targets=()
+  for p in "${pks[@]}"
+  do
+    if ! is-installed "$p"
+    then
+      warn "Package $p is not installed, use install"
+      bad=1
+      continue
+    fi
+    guard-running-cygwin "$p" || continue
+    if in-index "$p" && [[ ${INST_FILE[$p]} == "${IDX_FILE[$p]##*/}" ]]
+    then
+      targets+=("$p")
+      continue
+    fi
+    # the installed version is not current: look for its archive in the cache
+    hit=$(find "$cachedir" -type f -name "${INST_FILE[$p]}" -print -quit 2>/dev/null)
+    if [[ $hit ]]
+    then
+      PLAN_ARCHIVE[$p]=$hit
+      targets+=("$p")
+    elif in-index "$p"
+    then
+      warn "${INST_FILE[$p]} is not available, reinstalling the current version"
+      targets+=("$p")
+    else
+      warn "Package $p: no archive available to reinstall from"
+      bad=1
+    fi
+  done
+  (( bad )) && return 1
+  for p in "${targets[@]}"
+  do
+    REINST_SET[$p]=1
+  done
+  for p in "${targets[@]}"
+  do
+    if [[ ${PLAN_ARCHIVE[$p]} ]] || ! in-index "$p"
+    then
+      PLAN_SEEN[$p]=1
+      PLAN+=("$p")
+      PLAN_ACT[$p]=reinstall
+    else
+      plan-visit "$p"
+    fi
+  done
+  run-plan
+}
+
+function apt-upgrade {
+  find-workspace
+  load-index
+  load-db
+  local p targets=() bad=0
+  if (( ${#pks[@]} ))
+  then
+    for p in "${pks[@]}"
+    do
+      if ! is-installed "$p"
+      then
+        warn "Package $p is not installed"
+        bad=1
+      elif is-upgradable "$p"
+      then
+        targets+=("$p")
+      else
+        echo "$p is already the newest version"
+      fi
+    done
+  else
+    while read -r p
+    do
+      is-upgradable "$p" && targets+=("$p")
+    done < <(sorted-installed)
+  fi
+  for p in "${targets[@]}"
+  do
+    guard-running-cygwin "$p" && UPG_SET[$p]=1
+  done
+  for p in "${!UPG_SET[@]}"
+  do
+    plan-visit "$p"
+  done
+  if (( ! ${#PLAN[@]} ))
+  then
+    echo 'All packages are up to date.'
+    return $bad
+  fi
+  run-plan || return 1
+  return $bad
+}
+
+function apt-remove {
+  check-packages || return 1
+  load-db
+  local p q d idx=0 bad=0 targets=() dependents
+  find-workspace soft && load-index && idx=1
+  for p in "${pks[@]}"
+  do
+    if ! is-installed "$p"
+    then
+      echo "Package $p is not installed, skipping"
+      continue
+    fi
+    if is-essential "$p"
+    then
+      warn "apt-cyg cannot remove essential package $p"
+      bad=1
+      continue
+    fi
+    targets+=("$p")
+  done
+  # refuse to break installed packages that still depend on a target
+  if (( idx ))
+  then
+    for p in "${targets[@]}"
+    do
+      dependents=
+      while read -r q
+      do
+        in-list "$q" "${targets[*]}" && continue
+        for d in ${IDX_DEPS[$q]}
+        do
+          [[ $d == "$p" ]] && dependents+=" $q"
+        done
+      done < <(sorted-installed)
+      if [[ $dependents ]]
+      then
+        if [[ -v force ]]
+        then
+          warn "removing $p anyway (--force), needed by:$dependents"
+        else
+          warn "cannot remove $p, needed by:$dependents (use --force)"
+          bad=1
+        fi
+      fi
+    done
+  else
+    warn 'no setup.ini available, reverse dependencies not checked'
+  fi
+  (( bad )) && return 1
+  (( ${#targets[@]} )) || return 0
+  echo 'The following packages will be REMOVED:'
+  printf '  %s\n' "${targets[@]}"
+  if [[ -v simulate ]]
+  then
+    echo 'Simulation only, nothing was changed.'
+    return 0
+  fi
+  confirm || { echo Aborted.; return 1; }
+  for p in "${targets[@]}"
+  do
+    remove-package "$p"
+  done
+}
+
+function apt-autoremove {
+  find-workspace
+  load-index
+  load-db
+  local p d manual=0 orphans=()
+  declare -A keep
+  local -a stack
+  for p in "${!INST_FLAG[@]}"
+  do
+    [[ ${INST_FLAG[$p]} == 1 ]] && manual=1
+  done
+  # with no manual marks every package would look orphaned
+  if (( ! manual ))
+  then
+    warn 'no package is marked as manually installed, refusing to autoremove'
+    return 1
+  fi
+  # roots: manual picks, Base category, essentials, and unknown packages
+  # (their dependencies cannot be known, so assume they need everything)
+  for p in "${!INST_FILE[@]}"
+  do
+    if [[ ${INST_FLAG[$p]} == 1 ]] || in-list Base "${IDX_CAT[$p]}" ||
+       in-list "$p" "$ESSENTIAL_PKGS" || ! in-index "$p"
+    then
+      stack+=("$p")
+    fi
+  done
+  # mark everything reachable through dependencies
+  while (( ${#stack[@]} ))
+  do
+    p=${stack[-1]}
+    unset 'stack[-1]'
+    [[ ${keep[$p]} ]] && continue
+    keep[$p]=1
+    for d in ${IDX_DEPS[$p]}
+    do
+      is-installed "$d" && [[ ! ${keep[$d]} ]] && stack+=("$d")
+    done
+  done
+  while read -r p
+  do
+    [[ ${keep[$p]} ]] || orphans+=("$p")
+  done < <(sorted-installed)
+  if (( ! ${#orphans[@]} ))
+  then
+    echo 'Nothing to autoremove.'
+    return 0
+  fi
+  echo 'The following packages are no longer required and will be REMOVED:'
+  printf '  %s\n' "${orphans[@]}"
+  if [[ -v simulate ]]
+  then
+    echo 'Simulation only, nothing was changed.'
+    return 0
+  fi
+  confirm || { echo Aborted.; return 1; }
+  for p in "${orphans[@]}"
+  do
+    remove-package "$p"
+  done
+}
+
+function apt-check {
+  load-db
+  local p d e n errors=0 warnings=0 idx=0 broken=() missing=()
+  find-workspace soft && load-index && idx=1
+  echo 'Checking installed.db...'
+  if [[ ! -f $DB ]]
+  then
+    echo "E: $DB does not exist"
+    (( errors++ ))
+  else
+    # header on line one, then exactly three fields per line
+    n=$(gawk '
+    NR == 1 { if ($1 != "INSTALLED.DB") { print "E: line 1: missing INSTALLED.DB header"; bad++ } ; next }
+    NF != 3 { print "E: line " NR ": malformed entry: " $0; bad++ }
+    END { exit bad > 0 }
+    ' "$DB") || {
+      echo "$n"
+      (( errors += $(grep -c '^E:' <<< "$n") ))
+    }
+  fi
+  echo 'Checking packages...'
+  while read -r p
+  do
+    if [[ ! -f $SETUP/$p.lst.gz ]]
+    then
+      echo "E: $p: file manifest missing"
+      (( errors++ ))
+      broken+=("$p")
+    elif [[ -v files ]]
+    then
+      # every listed non-directory entry must exist
+      n=0
+      while IFS= read -r e
+      do
+        e=${e#./}
+        [[ $e && $e != */ ]] || continue
+        [[ -e $ROOT/$e || -L $ROOT/$e ]] || { (( n++ )); (( n <= 3 )) && echo "E: $p: missing file /$e"; }
+      done < <(gzip -cd -- "$SETUP/$p.lst.gz")
+      if (( n ))
+      then
+        (( n > 3 )) && echo "E: $p: ... $n files missing in total"
+        (( errors++ ))
+        broken+=("$p")
+      fi
+    fi
+    if (( idx ))
+    then
+      if ! in-index "$p"
+      then
+        echo "W: $p: not in setup.ini (obsolete or locally installed)"
+        (( warnings++ ))
+      fi
+      for d in ${IDX_DEPS[$p]}
+      do
+        if ! is-installed "$d"
+        then
+          echo "E: $p: missing dependency $d"
+          (( errors++ ))
+          in-list "$d" "${missing[*]}" || missing+=("$d")
+        fi
+      done
+    fi
+  done < <(sorted-installed)
+  for p in "$POSTINSTALL"/*.{sh,dash,bat,cmd}
+  do
+    [[ -f $p ]] || continue
+    case ${p##*/} in 0p_* | zp_*) continue ;; esac
+    echo "W: postinstall script not run yet: ${p##*/}"
+    (( warnings++ ))
+  done
+  if (( idx ))
+  then
+    n=0
+    while read -r p
+    do
+      is-upgradable "$p" && (( n++ ))
+    done < <(sorted-installed)
+    (( n )) && echo "I: $n package(s) can be upgraded"
+  else
+    echo 'W: no setup.ini available, dependencies were not checked'
+    (( warnings++ ))
+  fi
+  echo "check: $errors error(s), $warnings warning(s)"
+  (( errors )) || return 0
+  if [[ ! -v fix ]]
+  then
+    echo 'Run "apt-cyg2 check --fix" to repair what can be repaired.'
+    return 1
+  fi
+  (( idx )) || die 'cannot fix without setup.ini'
+  # repair: install missing dependencies, reinstall broken packages
+  for p in "${broken[@]}"
+  do
+    in-index "$p" && REINST_SET[$p]=1
+  done
+  for p in "${missing[@]}" "${broken[@]}"
+  do
+    plan-visit "$p"
+  done
+  [[ -v simulate ]] || acquire-lock
+  run-plan
+}
+
+function apt-download {
+  check-packages || return 1
+  find-workspace
+  load-index
+  local p rc=0
+  for p in "${pks[@]}"
+  do
+    if ! in-index "$p"
+    then
+      warn "Unable to locate package $p"
+      rc=1
+      continue
+    fi
+    # cache only: no manifest is written for a package that is not installed
+    fetch-package "$p" && echo "$REPLY" || rc=1
+  done
+  return $rc
+}
+
+function apt-show {
+  check-packages || return 1
+  find-workspace
+  load-db
+  local p names= inst=
+  for p in "${pks[@]}"
+  do
+    names+=$p$'\n'
+    is-installed "$p" && inst+="$p ${INST_FILE[$p]}"$'\n'
+  done
+  # one pass over setup.ini for all names; a record is one package stanza
+  names=$names inst=$inst gawk '
+  BEGIN {
+    n = split(ENVIRON["names"], want, "\n") - 1
+    m = split(ENVIRON["inst"], a, "\n")
+    for (i = 1; i <= m; i++) if (split(a[i], kv, " ") == 2) inst[kv[1]] = kv[2]
+    for (i = 1; i <= n; i++) idx[want[i]] = i
+  }
+  $1 in idx { rec[$1] = $0 }
+  END {
+    for (i = 1; i <= n; i++) {
+      p = want[i]
+      if (i > 1) print ""
+      if (p in rec) {
+        r = rec[p]
+        sub(/\n+$/, "", r)
+        print "@ " r
+        print "installed: " (p in inst ? inst[p] : "no")
+      } else {
+        print "Unable to locate package " p
+        miss = 1
+      }
+    }
+    exit miss
+  }
+  ' RS='\n\n@ ' FS='\n' "$archdir/setup.ini"
+}
+
+DEP_AWK='
+BEGIN { FS = "|" }
+NR > 1 {
+  n = split($6, a, " ")
+  for (i = 1; i <= n; i++) {
+    if (ENVIRON["reverse"]) {
+      cnt[a[i]]++
+      reqs[a[i]][cnt[a[i]]] = $1
+    } else {
+      reqs[$1][i] = a[i]
+    }
+  }
+}
+END { prpg(ENVIRON["pkg"]) }
+function join(arr, from, to, sep,    out, i) {
+  out = arr[from]
+  for (i = from + 1; i <= to; i++) out = out sep arr[i]
+  return out
+}
+# the path stack doubles as cycle detection: never revisit a node on the path
+function onpath(small,    i) {
+  for (i = 1; i <= depth; i++) if (spath[i] == small) return 1
+  return 0
+}
+function prpg(fpg,    each) {
+  if (onpath(fpg)) return
+  spath[++depth] = fpg
+  print join(spath, 1, depth, ENVIRON["sep"])
+  if (fpg in reqs)
+    for (each in reqs[fpg])
+      prpg(reqs[fpg][each])
+  delete spath[depth--]
+}
+'
+
+function apt-depends {
+  check-packages || return 1
+  find-workspace
+  load-index
+  local p rc=0
+  for p in "${pks[@]}"
+  do
+    in-index "$p" || { warn "Unable to locate package $p"; rc=1; continue; }
+    pkg=$p sep=' > ' reverse= gawk "$DEP_AWK" "$archdir/setup.idx"
+  done
+  return $rc
+}
+
+function apt-rdepends {
+  check-packages || return 1
+  find-workspace
+  load-index
+  local p
+  for p in "${pks[@]}"
+  do
+    pkg=$p sep=' < ' reverse=1 gawk "$DEP_AWK" "$archdir/setup.idx"
+  done
+}
+
+function apt-list {
+  load-db
+  local pkg sbq names=()
+  mapfile -t names < <(sorted-installed)
+  (( ${#names[@]} )) || return 0
+  for pkg in "${pks[@]}"
+  do
+    # a blank line between groups: let fails while sbq is still 0
+    let sbq++ && echo
+    printf '%s\n' "${names[@]}" | pat=$pkg gawk '$0 ~ ENVIRON["pat"]'
+  done
+  let sbq && return 0
+  printf '%s\n' "${names[@]}"
+}
+
+function apt-listall {
+  check-packages || return 1
+  find-workspace
+  build-index || return 1
+  local pkg sbq
+  for pkg in "${pks[@]}"
+  do
+    let sbq++ && echo
+    pat=$pkg gawk -F'|' 'NR > 1 && $1 ~ ENVIRON["pat"] { print $1 }' "$archdir/setup.idx"
+  done
+}
+
+function apt-category {
+  check-packages || return 1
+  find-workspace
+  build-index || return 1
+  local cat sbq
+  for cat in "${pks[@]}"
+  do
+    let sbq++ && echo
+    # whole word, case-insensitive: "Libs" must not match "Perl-Libs"
+    cat=$cat gawk -F'|' '
+    NR > 1 {
+      n = split($7, a, " ")
+      for (i = 1; i <= n; i++)
+        if (tolower(a[i]) == tolower(ENVIRON["cat"])) { print $1; break }
+    }
+    ' "$archdir/setup.idx"
+  done
+}
+
+function apt-listfiles {
+  check-packages || return 1
+  load-db
+  local pkg sbq rc=0
+  for pkg in "${pks[@]}"
+  do
+    (( sbq++ )) && echo
+    if is-installed "$pkg" && [[ -f $SETUP/$pkg.lst.gz ]]
+    then
+      gzip -cd -- "$SETUP/$pkg.lst.gz"
+      continue
+    fi
+    # not installed: list the archive itself, write nothing under /etc/setup
+    find-workspace
+    load-index
+    if in-index "$pkg" && fetch-package "$pkg" >/dev/null
+    then
+      tar -tf "$REPLY"
+    else
+      warn "Unable to list files of $pkg"
+      rc=1
+    fi
+  done
+  return $rc
+}
+
+function apt-search {
+  check-packages || return 1
+  load-db
+  local pkg key keys= p
+  for pkg in "${pks[@]}"
+  do
+    key=
+    # a bare command name resolves through PATH (live system only)
+    [[ -z $ROOT && $pkg != */* ]] && key=$(type -P -- "$pkg")
+    [[ $key ]] || key=$pkg
+    keys+=$key$'\n'
+  done
+  echo 'Searching installed packages...'
+  # one stream of all manifests, each prefixed by a \001 owner marker
+  for p in $(sorted-installed)
+  do
+    [[ -f $SETUP/$p.lst.gz ]] || continue
+    printf '\001%s\n' "$p"
+    gzip -cd -- "$SETUP/$p.lst.gz"
+  done | keys=$keys gawk '
+  function norm(s) {
+    sub(/^\.?\//, "", s)
+    # /bin and /lib are mounts of /usr/bin and /usr/lib on cygwin
+    if (s ~ /^(bin|lib)\//) s = "usr/" s
+    return s
+  }
+  BEGIN {
+    n = split(ENVIRON["keys"], k, "\n") - 1
+    for (i = 1; i <= n; i++) {
+      isp[i] = (k[i] ~ /\//)
+      if (isp[i]) k[i] = norm(k[i])
+    }
+  }
+  /^\001/ { pkg = substr($0, 2); next }
+  {
+    line = norm($0)
+    b = line
+    sub(/.*\//, "", b)
+    for (i = 1; i <= n; i++) {
+      hit = isp[i] ? (line == k[i] || line == k[i] ".exe") : (b == k[i] || b == k[i] ".exe")
+      if (hit && ! ((i, pkg) in seen)) {
+        seen[i, pkg]
+        out[i] = out[i] pkg "\n"
+      }
+    }
+  }
+  END {
+    for (i = 1; i <= n; i++) printf "%s", out[i]
+  }
+  '
+}
+
+function apt-searchall {
+  check-packages || return 1
+  local pkg qs matches=$TMPD/matches
+  for pkg in "${pks[@]}"
+  do
+    qs="text=1&arch=$arch&grep=$(urlencode "$pkg")"
+    # small text answer: ask for a gzip transfer
+    fetch "https://cygwin.com/cgi-bin2/package-grep.cgi?$qs" "$matches" text ||
+      { warn "searchall: request failed for $pkg"; return 1; }
+    gawk '
+    NR == 1 {next}
+    mc[$1]++ {next}
+    /-debuginfo-/ {next}
+    /^cygwin32-/ {next}
+    {print $1}
+    ' FS=-[[:digit:]] "$matches"
+  done
+}
+
+function apt-mirror {
+  if (( ${#pks[@]} ))
+  then
+    rc-set last-mirror "${pks[0]}" || die "cannot write $RC"
+    echo "Mirror set to ${pks[0]}."
+  else
+    rc-get last-mirror
+  fi
+}
+
+function apt-cache {
+  local vas
+  if (( ${#pks[@]} ))
+  then
+    # setup.exe expects a windows path in setup.rc
+    if command -v cygpath >/dev/null
+    then
+      vas=$(cygpath -aw "${pks[0]}")
+    else
+      vas=$(realpath -m -- "${pks[0]}")
+    fi
+    rc-set last-cache "$vas" || die "cannot write $RC"
+    echo "Cache set to $vas."
+  else
+    rc-get last-cache
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# process options
+
+command=
+until (( $# == 0 ))
+do
+  case $1 in
+    --nodeps)    nodeps=1    ;;
+    --noscripts) noscripts=1 ;;
+    --force)     force=1     ;;
+    --fix)       fix=1       ;;
+    --files)     files=1     ;;
+    -y | --yes)  yes=1       ;;
+    -s | --simulate | --dry-run) simulate=1 ;;
+    --name=*)    pkgname=${1#--name=} ;;
+    --version)
+      printf '%s' "$version"
+      exit 0
+    ;;
+    -h | --help)
+      printf '%s' "$usage"
+      exit 0
+    ;;
+    --)
+      shift
+      pks+=("$@")
+      break
+    ;;
+    -*)
+      die "unknown option: $1"
+    ;;
+    *)
+      # the first operation word is the command, everything else a target
+      if [[ ! $command ]] && in-list "$1" "$COMMANDS"
+      then
+        command=$1
+      else
+        pks+=("$1")
+      fi
+    ;;
+  esac
+  shift
+done
+
+# names on a pipe, e.g. cat list.txt | apt-cyg2 install
+if [[ $command && ${#pks[@]} -eq 0 && -p /dev/stdin ]] && in-list "$command" "$TARGET_COMMANDS"
+then
+  while read -r line
+  do
+    [[ $line ]] && pks+=("$line")
+  done
+fi
+
+if [[ $command ]] && type -t "apt-$command" | grep -q function
+then
+  command -v gawk >/dev/null || die 'gawk is required'
+  readonly arch=${APT_CYG_ARCH:-${HOSTTYPE/i6/x}}
+  TMPD=$(mktemp -d "${TMPDIR:-/tmp}/apt-cyg2.XXXXXX") || die 'cannot create a temp directory'
+  if in-list "$command" "$MUTATING_COMMANDS" && [[ ! -v simulate ]]
+  then
+    acquire-lock
+  fi
+  "apt-$command"
+  exit
+else
+  printf '%s' "$usage"
+  exit 1
+fi
