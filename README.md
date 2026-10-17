@@ -33,55 +33,63 @@ time CFLAGS="-O2 -pipe -march=${MARCH} ${EXTRA_CFLAGS}" \
 CXXFLAGS="-O2 -pipe -march=${MARCH} ${EXTRA_CFLAGS}" \
 ./configure \
     --prefix="${PREFIX}" \
-    --exec-prefix="${PREFIX}" \
-    --localstatedir="${PREFIX}/var" \
-    --sysconfdir="${PREFIX}/etc" \
-    --with-config-file-path="${CONFIG_FILE_PATH}" \
-    --with-config-file-scan-dir="${CONFIG_SCAN_DIR}" \
-    --with-layout=GNU \
+    --enable-shared \
+    --disable-static \
     --disable-rpath \
     --disable-fiber-asm \
     --disable-all \
+    --with-pear \
     --enable-cli \
     --enable-cgi \
     --enable-fpm \
     --with-fpm-acl \
     --enable-embed \
     --enable-phpdbg \
+    --with-external-pcre \
+    --with-config-file-path="${PREFIX}/etc" \
+    --with-config-file-scan-dir="${PREFIX}/etc/php.d" \
     \
-    --enable-phar \
-    --with-curl \
-    --enable-mbstring \
-    --enable-gd \
-    --with-external-gd \
-    --with-iconv \
-    --enable-intl \
-    --enable-pdo \
-    --with-pdo-sqlite \
-    --with-sqlite3 \
-    --with-sodium \
+    --enable-filter \
+    --enable-ctype \
+    --with-zlib \
+    --with-openssl \
+    --enable-tokenizer \
+    --enable-posix \
+    --enable-bcmath \
+    --enable-sockets \
+    --enable-exif \
     --enable-xml \
     --with-libxml \
-    --enable-xmlreader \
-    --enable-xmlwriter \
-    --with-zip \
-    --with-zlib \
-    --enable-dom \
-    --enable-fileinfo \
-    --enable-session \
     --enable-simplexml \
-    --enable-ctype \
-    --enable-bcmath \
-    --with-mysqli=mysqlnd \
-    --with-pdo-mysql=mysqlnd \
-    --with-jpeg \
-    --with-freetype \
-    --with-webp \
-    --enable-exif \
-    --with-gettext \
-    --enable-sockets \
-    --enable-tokenizer \
-    --with-bz2 \
+    --enable-xmlwriter \
+    --with-iconv=static,/usr \
+    --enable-mbstring=shared \
+    --enable-intl=shared \
+    --enable-phar=shared \
+    --with-zip=shared \
+    --with-curl=shared \
+    \
+    --enable-pdo \
+    --enable-session \
+    --enable-dom \
+    --enable-xmlreader=shared \
+    --enable-gd=shared \
+    --with-external-gd \
+    --with-sodium=shared,/usr \
+    --with-sqlite3=shared,/usr \
+    --with-pdo-sqlite=shared,/usr \
+    --with-ffi=shared,/usr \
+    --with-bz2=shared,/usr \
+    --with-gettext=shared,/usr \
+    --enable-fileinfo=shared \
+    \
+    --with-gmp=shared,/usr \
+    --with-tidy=shared,/usr \
+    --with-mysqli=shared,mysqlnd \
+    --with-pdo-mysql=shared,mysqlnd \
+    --with-pdo-pgsql=shared,/usr \
+    --with-pgsql=shared,/usr \
+    --with-imap=shared,/usr \
     ac_cv_func_ttyname_r_works=yes
 ```
 
